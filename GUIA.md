@@ -543,84 +543,245 @@ offsets negativos sin `sub`, es esto.
 
 El resultado vuelve para arriba: `%rax` → C lo imprime → Python lo captura y lo muestra.
 
-### 6.2 Qué API y qué conversión elegir
+### 6.2 Qué API elegimos y por qué
 
-**Mi recomendación: temperaturas.** API [Open-Meteo](https://open-meteo.com/) (gratis, sin
-API key, sin registro) y conversión Celsius → Fahrenheit + Celsius → Kelvin en assembler.
+**Decisión del grupo: [dolarapi.com](https://dolarapi.com).** Gratis, sin API key y sin
+registro.
+
+Los criterios que pesaron, en orden:
+
+1. **Sin clave ni registro.** Si el profesor no puede correr el trabajo en su máquina sin
+   darse de alta en ningún lado, el trabajo no sirve.
+2. **Que devuelva decimales.** Es el criterio decisivo: el corazón del TP es la conversión
+   de punto flotante a entero. Una API que devuelva enteros deja esa operación vacía.
+3. **Que el cálculo use multiplicación *y* división.** Ahí aparecen `imulq`, `cqto` e
+   `idivq`, que son instrucciones no triviales y dan material real para mostrar en la
+   defensa. Una suma sola no alcanza.
+4. **JSON plano.** Cuanto menos tiempo se pierde parseando en Python, más queda para lo
+   que la materia evalúa.
+
+Y una razón de fondo que no es solo conveniencia: **el dinero es el ejemplo canónico de
+por qué no se usa punto flotante**. Trabajar en centavos no es un rodeo para esquivar los
+registros `%xmm`, es lo que hace cualquier sistema financiero real, porque `0.1` no tiene
+representación exacta en binario y los errores se acumulan. La decisión de diseño se
+sostiene por sí misma.
+
+Se descartó Open-Meteo (temperaturas, Celsius → Fahrenheit), que era la recomendación
+anterior de esta guía. Es igual de válida técnicamente, pero la justificación del punto
+fijo es más débil y el tema es menos propio.
+
+#### Los endpoints
 
 ```
-GET https://api.open-meteo.com/v1/forecast?latitude=-33.12&longitude=-64.35&current=temperature_2m
+GET https://dolarapi.com/v1/dolares/blue
+GET https://dolarapi.com/v1/dolares/oficial
 ```
 
-(esas coordenadas son Río Cuarto)
+> **Verificar antes de escribir una línea de código.** Los nombres exactos de los campos
+> de la respuesta (`compra`, `venta`, `casa`, `fechaActualizacion`) hay que confirmarlos
+> con un `curl` contra la API real: no están verificados en esta guía. Es el Paso 0.
 
-¿Por qué esta y no otra? Porque la fórmula `F = C × 9/5 + 32` usa multiplicación **y**
-división, que en assembler son instrucciones distintas y no triviales (`imulq`, `idivq` con
-`cqto`). Queda un TP más sustancioso que una simple suma.
+#### El cálculo
 
-**El truco de los decimales:** la API te devuelve algo como `18.3`. Hacer punto flotante en
-assembler es un dolor de cabeza (hay que meterse con SSE y `%xmm0`). La solución es
-**aritmética de punto fijo**: en Python multiplicás por 10 y mandás `183` como entero. El
-assembler trabaja con enteros, y al final dividís por 10 para mostrar. Todo el mundo
-contento.
+La **brecha cambiaria** entre el dólar blue y el oficial:
 
-Alternativas si preferís otra cosa:
+```
+brecha % = (blue − oficial) × 100 / oficial
+```
 
-| API | Conversión en ASM |
-|---|---|
-| [dolarapi.com](https://dolarapi.com) | ARS ↔ USD (trabajá en centavos para evitar floats) |
-| [Open-Meteo](https://open-meteo.com) | m/s ↔ km/h, hPa ↔ mmHg |
-| [REST Countries](https://restcountries.com) | km² ↔ millas², densidad de población |
+Resta, multiplicación y división en una sola rutina, con los dos operandos entrando por
+la pila. Como segunda rutina, la conversión de un monto en pesos a dólares:
 
-### 6.3 Plan de trabajo por commits
+```
+dólares = pesos × 100 / cotización
+```
 
-La consigna pide **un commit por funcionalidad implementada y validada**. Este es un
-desglose que cumple eso:
+#### La aritmética de punto fijo
 
-| # | Commit | Qué incluye |
+La API devuelve `1500.5`. Hacer punto flotante en ensamblador obliga a meterse con SSE y
+los registros `%xmm`, que es otro tema entero. La solución es **trabajar en centavos**:
+Python multiplica por 100 y manda enteros, el ensamblador opera con enteros, y Python
+divide por 100 al mostrar.
+
+Un ejemplo completo, con los números reales que da la rutina:
+
+```
+blue = 1500,00  →  150000 centavos
+oficial = 1000,00  →  100000 centavos
+
+ASM:  (150000 − 100000) × 10000 / 100000  =  5000
+
+5000 centésimas de punto porcentual  →  Python muestra 50,00 %
+```
+
+El factor es `10000` y no `100` porque se quieren dos decimales en el resultado: `100`
+para el porcentaje y `100` más para las centésimas.
+
+### 6.3 Las rutinas en ensamblador
+
+Este código está **probado y verificado**: compila, corre y da los resultados correctos,
+incluidos los casos de brecha negativa y brecha cero.
+
+```asm
+# conversiones.s — rutinas de cálculo del TP, en sintaxis AT&T
+#
+# Los dos argumentos útiles entran POR LA PILA: la función se declara en C con
+# ocho parámetros, los seis primeros se pasan en cero y se ignoran, y la ABI
+# System V AMD64 obliga al compilador a empujar el 7mo y el 8vo a la pila.
+#
+# Mapa del stack frame visto desde %rbp:
+#   24(%rbp) -> 8vo parámetro
+#   16(%rbp) -> 7mo parámetro
+#    8(%rbp) -> dirección de retorno (la puso 'call')
+#    0(%rbp) -> %rbp del llamador (lo puso 'pushq %rbp')
+
+    .section .text
+
+# brecha_cambiaria(0,0,0,0,0,0, blue_cent, oficial_cent) -> centésimas de %
+    .globl  brecha_cambiaria
+    .type   brecha_cambiaria, @function
+brecha_cambiaria:
+    pushq   %rbp
+    movq    %rsp, %rbp
+
+    movq    16(%rbp), %rax      # %rax = blue
+    subq    24(%rbp), %rax      # %rax = blue - oficial
+    imulq   $10000, %rax        # %rax = (blue - oficial) * 10000
+    cqto                        # extiende el signo de %rax hacia %rdx:%rax
+    idivq   24(%rbp)            # %rax = cociente, %rdx = resto
+
+    popq    %rbp
+    ret
+    .size   brecha_cambiaria, .-brecha_cambiaria
+
+# pesos_a_dolares(0,0,0,0,0,0, pesos_cent, cotiz_cent) -> centavos de dólar
+    .globl  pesos_a_dolares
+    .type   pesos_a_dolares, @function
+pesos_a_dolares:
+    pushq   %rbp
+    movq    %rsp, %rbp
+
+    movq    16(%rbp), %rax      # %rax = pesos en centavos
+    imulq   $100, %rax          # %rax = pesos * 100
+    cqto
+    idivq   24(%rbp)
+
+    popq    %rbp
+    ret
+    .size   pesos_a_dolares, .-pesos_a_dolares
+
+    .section .note.GNU-stack,"",@progbits
+```
+
+Tres detalles que conviene entender porque los van a preguntar:
+
+- **`cqto` antes de `idivq` no es opcional.** `idivq` divide el valor de 128 bits que
+  forman `%rdx:%rax` por el operando. Si `%rdx` tiene basura, el resultado es basura o el
+  programa aborta. `cqto` extiende el signo de `%rax` hacia `%rdx`, dejando el dividendo
+  bien formado. Es lo que hace que la brecha negativa dé bien.
+- **`imulq $10000, %rax` es la forma de dos operandos**, que deja el resultado de 64 bits
+  en `%rax`. Existe también `imulq %rcx` de un operando, que produce 128 bits en
+  `%rdx:%rax` — pero combinarla con `cqto` después es un error, porque `cqto` pisa `%rdx`
+  y destruye la mitad alta.
+- **La línea `.note.GNU-stack`** evita el aviso `missing .note.GNU-stack section implies
+  executable stack` que tiran los archivos del repositorio de cátedra.
+
+#### Verificación de que los argumentos van por la pila
+
+El desensamblado del llamador confirma el mecanismo:
+
+```
+push   -0x20(%rbp)          <- 8vo argumento a la pila
+push   -0x18(%rbp)          <- 7mo argumento a la pila
+mov    $0x0,%r9d            <- argumentos 1 a 6 por registros
+mov    $0x0,%r8d
+mov    $0x0,%ecx
+mov    $0x0,%edx
+mov    $0x0,%esi
+mov    $0x0,%edi
+call   <brecha_cambiaria>
+add    $0x10,%rsp           <- el llamador limpia los 16 bytes
+```
+
+Y la rutina leyéndolos:
+
+```
+brecha_cambiaria:
+    push   %rbp
+    mov    %rsp,%rbp
+    mov    0x10(%rbp),%rax       <- 7mo argumento
+    sub    0x18(%rbp),%rax       <- 8vo argumento
+    imul   $0x2710,%rax,%rax
+    cqto
+    idivq  0x18(%rbp)
+    pop    %rbp
+    ret
+```
+
+### 6.4 Paso a paso, commit por commit
+
+La consigna pide un commit por funcionalidad implementada **y validada**. Este desglose
+cumple eso y además permite repartir el trabajo entre los tres.
+
+| # | Paso | Qué tiene que quedar validado |
 |---|---|---|
-| 1 | `Agrega consigna y guía del TP` | ✅ ya hecho |
-| 2 | `Implementa rutina ASM de conversión C a F por stack` | `conversiones.s` + prueba manual |
-| 3 | `Agrega programa en C que invoca la rutina ASM` | `main.c` + `Makefile`, validado a mano |
-| 4 | `Agrega cliente Python que consume la API de Open-Meteo` | `cliente.py`, imprime el JSON crudo |
-| 5 | `Integra las tres capas: Python entrega datos al binario C` | el flujo completo andando |
-| 6 | `Agrega conversión a Kelvin en ASM` | segunda rutina |
-| 7 | `Agrega manejo de errores y validación de entrada` | qué pasa si la API falla |
-| 8 | `Documenta compilación, uso y evidencia de GDB` | README + capturas |
+| 0 | `curl` a los dos endpoints, mirar el JSON crudo | La API responde y sabemos los nombres exactos de los campos |
+| 1 | Escribir la decisión de punto fijo | Queda documentado el factor y qué se trunca |
+| 2 | `cliente.py`: baja, parsea e imprime los enteros escalados | Python solo, sin C todavía |
+| 3 | `conversiones.s` + `prueba.c` con valores fijos | La rutina da el número correcto, verificado a mano |
+| 4 | `main.c` real: recibe por `argv`, llama al ASM, imprime | La capa C anda sola desde la terminal |
+| 5 | Integración: Python invoca el binario y muestra el resultado | Las tres capas conectadas |
+| 6 | Sesión de GDB: el stack antes, durante y después | **El requisito que más pesa** |
+| 7 | Manejo de errores: API caída, campo faltante, división por cero | No se rompe |
+| 8 | README con compilación, uso y evidencia | Listo para entregar |
 
-> Cada mensaje de commit en español (como pide la cátedra implícitamente) y que diga **qué
-> se implementó y que quedó validado**.
+Dos cosas sobre el orden, que no son caprichosas:
 
-### 6.4 Estructura de archivos sugerida
+- **El paso 3 va antes que el 4** a propósito. Primero la rutina con valores fijos y un
+  `main.c` mínimo; recién cuando da bien se la conecta a la entrada real. Si se hace todo
+  junto y falla, no se sabe si el problema está en el parseo de Python, en el pasaje de
+  argumentos o en el ensamblador.
+- **El paso 6 no es el último.** Si GDB se deja para el final y algo no cierra, hay que
+  rehacer la rutina con el informe ya escrito.
+
+#### El caso borde que hay que cubrir sí o sí
+
+`idivq` **aborta el programa** si el divisor es cero — no devuelve un error, lo mata con
+una excepción de hardware. Si la API devolviera el oficial en `0`, o si el parseo fallara
+y mandara un `0`, el binario se cae. La validación va en C antes de llamar a la rutina, y
+es parte del paso 7.
+
+### 6.5 Estructura de archivos
 
 ```
 practico2/
-├── README.md              # cómo compilar y correr
-├── CONSIGNA.md            # la consigna y los requisitos
-├── GUIA.md                # este archivo
-├── Makefile               # para no tipear los as/gcc a mano
+├── README.md              portada e instrucciones de compilación
+├── CONSIGNA.md            los requisitos del TP
+├── GUIA.md                esta guía
+├── PROCEDIMIENTO.md       el registro de lo hecho, con capturas
+├── Makefile               para no tipear los as/gcc a mano
 ├── asm/
-│   └── conversiones.s     # las rutinas de cálculo
+│   └── conversiones.s     las rutinas de cálculo
 ├── c/
-│   └── main.c             # capa intermedia
+│   └── main.c             capa intermedia
 ├── python/
-│   └── cliente.py         # capa superior
-└── docs/
-    └── gdb/               # capturas de las sesiones de depuración
+│   └── cliente.py         capa superior
+└── capturas/              las capturas de las sesiones de GDB
 ```
 
 ---
 
-## Parte 7 — Por dónde empezar mañana
+## Parte 7 — Por dónde seguir
 
-1. **Hacé la Parte 2 completa** (la sesión de GDB del `asm hello world`). No la saltees:
-   es una hora de trabajo y es la que hace que todo lo demás tenga sentido.
-2. Compilá y corré las Partes 3 y 4. Confirmá que ves los `35`.
-3. Hacé la sesión de GDB de 4.4 y sacá la captura de `x/1gx $rbp+16`.
-4. Recién ahí arrancá con el código propio del TP, commit por commit según 6.3.
+Las Partes 1 a 5 están terminadas y documentadas en `PROCEDIMIENTO.md`. Lo que queda es
+el TP propiamente dicho, siguiendo la tabla de 6.4:
 
-Cuando llegues al punto 4, avisame y armamos el esqueleto (`Makefile`, `conversiones.s`,
-`main.c`, `cliente.py`) juntos.
+1. **Paso 0, antes que nada:** `curl` a los dos endpoints de dolarapi y anotar los nombres
+   exactos de los campos. Todo lo demás depende de eso.
+2. Pasos 2 y 3 en paralelo, que no dependen uno del otro: uno arma `cliente.py`, otro
+   compila y prueba `conversiones.s` con `prueba.c`.
+3. Paso 4 cuando el 3 esté validado.
+4. Integración, GDB y errores, en ese orden.
 
 ---
 
