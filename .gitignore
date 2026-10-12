@@ -12,6 +12,11 @@ program
 programa
 programa2
 
+# Binarios del TP (los genera make)
+calculadora
+calculadora_c
+asm/prueba
+
 # Historial y configuración local de GDB
 .gdb_history
 .gdbinit

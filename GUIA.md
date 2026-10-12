@@ -516,8 +516,8 @@ offsets negativos sin `sub`, es esto.
 
 ```
 ┌─────────────────────────────────────────────┐
-│  PYTHON            cliente.py               │
-│  · consulta la API REST con requests        │
+│  PYTHON            python/cliente.py        │
+│  · consulta la API REST con urllib          │
 │  · parsea el JSON                           │
 │  · invoca al binario de C con los datos     │
 │  · muestra el resultado final               │
@@ -525,7 +525,7 @@ offsets negativos sin `sub`, es esto.
                    │  argumentos por línea de comandos
                    ▼
 ┌─────────────────────────────────────────────┐
-│  C                 main.c                   │
+│  C                 c/main.c                 │
 │  · recibe los datos crudos (argv)           │
 │  · llama a las rutinas de assembler         │
 │  · imprime el resultado por stdout          │
@@ -533,7 +533,7 @@ offsets negativos sin `sub`, es esto.
                    │  convención de llamadas — POR LA PILA
                    ▼
 ┌─────────────────────────────────────────────┐
-│  ASSEMBLER         conversiones.s           │
+│  ASSEMBLER         asm/conversiones.s       │
 │  · arma su stack frame                      │
 │  · lee los parámetros de 16(%rbp), 24(%rbp) │
 │  · HACE EL CÁLCULO                          │
@@ -778,7 +778,443 @@ brecha_cambiaria:
     ret
 ```
 
-### 6.4 Paso a paso, commit por commit
+#### Probarla sola: `asm/prueba.c`
+
+El `.s` no se puede ejecutar por sí mismo: necesita un programa que lo llame. Antes de
+conectarlo con nada, se lo prueba con un `main` mínimo en C que le pasa valores fijos,
+escritos a mano. Es probar el motor en el banco antes de montarlo en el auto.
+
+```c
+/* prueba.c — prueba de las rutinas en ensamblador con valores fijos.
+   Los precios van en centavos: 1540,00 pesos = 154000. */
+#include <stdio.h>
+
+extern long brecha_cambiaria(long, long, long, long, long, long, long, long);
+extern long pesos_a_dolares(long, long, long, long, long, long, long, long);
+
+int main(void) {
+    long blue    = 154000;   /* venta blue    del 12/10/2026 */
+    long oficial = 153500;   /* venta oficial del 09/10/2026 */
+
+    long brecha = brecha_cambiaria(0, 0, 0, 0, 0, 0, blue, oficial);
+    printf("brecha: %ld centesimas = %ld.%02ld %%\n", brecha, brecha / 100, brecha % 100);
+
+    long pesos   = 1000000;  /* 10.000,00 pesos */
+    long dolares = pesos_a_dolares(0, 0, 0, 0, 0, 0, pesos, blue);
+    printf("10000 pesos al blue: %ld centavos = USD %ld.%02ld\n", dolares, dolares / 100, dolares % 100);
+
+    return 0;
+}
+```
+
+Fijate en las llamadas: van **ocho** argumentos, seis ceros y los dos valores. Es a
+propósito: como solo seis entran por registros, el compilador está obligado a mandar los
+dos últimos **por la pila**.
+
+Para compilar y correr, desde la carpeta `asm/`:
+
+```bash
+as --64 -g -o conversiones.o conversiones.s
+gcc -g3 -O0 -c prueba.c -o prueba.o
+gcc -o prueba prueba.o conversiones.o
+./prueba
+```
+
+Tiene que imprimir exactamente:
+
+```
+brecha: 32 centesimas = 0.32 %
+10000 pesos al blue: 649 centavos = USD 6.49
+```
+
+Y se verifica con la calculadora: (1540 − 1535) / 1535 × 100 = 0,3257 → **0,32 %**, y
+10000 / 1540 = 6,4935 → **6,49**.
+
+No tiene que aparecer el aviso de `.note.GNU-stack`: la última línea del `.s` lo evita. Si
+aparece, el bloque no se copió entero.
+
+### 6.4 La capa de C: `c/main.c`
+
+Recibe los precios en centavos por línea de comandos, los valida, llama a las rutinas e
+imprime los resultados como líneas `clave=valor`, que es un formato fácil de leer desde
+Python.
+
+```c
+/* main.c — capa intermedia del TP.
+ *
+ * Recibe los precios en centavos por linea de comandos, los valida y llama a las
+ * rutinas de calculo. Imprime los resultados como lineas clave=valor para que la
+ * capa de Python los lea.
+ *
+ * Uso:  ./calculadora <blue_centavos> <oficial_centavos> [pesos_centavos]
+ *
+ * Las rutinas se declaran con ocho parametros: los seis primeros viajan por
+ * registros y se pasan en cero; el 7mo y el 8vo no entran en los registros y la
+ * ABI obliga a pasarlos por la pila.
+ */
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+extern long brecha_cambiaria(long, long, long, long, long, long, long, long);
+extern long pesos_a_dolares(long, long, long, long, long, long, long, long);
+
+/* Cota de cordura: 1 billon de pesos. Por encima, las multiplicaciones de las
+   rutinas podrian desbordar los 64 bits. */
+#define MAX_CENTAVOS 100000000000000L
+
+/* Convierte un argumento a long. Devuelve 0 si es un numero valido en rango. */
+static int leer_centavos(const char *texto, const char *nombre, long *destino) {
+    char *fin;
+    errno = 0;
+    long valor = strtol(texto, &fin, 10);
+
+    if (fin == texto || *fin != '\0') {
+        fprintf(stderr, "%s no es un numero entero: '%s'\n", nombre, texto);
+        return 1;
+    }
+    if (errno == ERANGE || valor <= 0 || valor > MAX_CENTAVOS) {
+        fprintf(stderr, "%s fuera de rango: '%s' (entre 1 y %ld centavos)\n", nombre, texto, MAX_CENTAVOS);
+        return 1;
+    }
+    *destino = valor;
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "uso: %s <blue_centavos> <oficial_centavos> [pesos_centavos]\n", argv[0]);
+        return 2;
+    }
+
+    long blue, oficial, pesos = 0;
+    if (leer_centavos(argv[1], "blue", &blue))       return 1;
+    if (leer_centavos(argv[2], "oficial", &oficial)) return 1;
+    if (argc == 4 && leer_centavos(argv[3], "pesos", &pesos)) return 1;
+
+    /* La validacion anterior garantiza oficial > 0 y blue > 0: idivq con
+       divisor cero no devuelve un error, mata el proceso. */
+    long brecha = brecha_cambiaria(0, 0, 0, 0, 0, 0, blue, oficial);
+    printf("brecha_centesimas=%ld\n", brecha);
+
+    if (argc == 4) {
+        long dolares = pesos_a_dolares(0, 0, 0, 0, 0, 0, pesos, blue);
+        printf("dolares_centavos=%ld\n", dolares);
+    }
+    return 0;
+}
+```
+
+La validación no es decorativa. `idivq` con divisor cero **no devuelve un error: mata el
+proceso** con una excepción del procesador. Por eso `main.c` rechaza el cero, los
+negativos, el texto y los números fuera de rango **antes** de llamar a la rutina. Probado:
+
+```
+./calculadora 154000 0           ->  oficial fuera de rango: '0' (entre 1 y 100000000000000 centavos)
+./calculadora abc 153500         ->  blue no es un numero entero: 'abc'
+./calculadora 154000x 153500     ->  blue no es un numero entero: '154000x'
+./calculadora 154000 153500 1000000
+brecha_centesimas=32
+dolares_centavos=649
+```
+
+La cota `MAX_CENTAVOS` existe porque las rutinas multiplican por 10.000: con números
+gigantes la cuenta desbordaría los 64 bits y daría un resultado sin sentido, sin ningún
+aviso.
+
+#### La Iteración 1: `c/conversiones_c.c`
+
+La consigna pide dos iteraciones: primero todo con C y Python **sin ensamblador**, y
+después con ensamblador. Para no escribir dos programas, se escriben las mismas dos
+rutinas en C puro, **con exactamente la misma firma**:
+
+```c
+/* conversiones_c.c — las mismas rutinas que asm/conversiones.s, en C puro.
+ *
+ * Es la Iteracion 1 del TP: todo resuelto con C y Python, sin ensamblador.
+ * Tiene exactamente la misma firma que la version en ensamblador, asi main.c no
+ * cambia entre iteraciones: solo se enlaza contra uno u otro archivo.
+ *
+ * La division entera de C trunca hacia cero, igual que idivq, de modo que las dos
+ * versiones dan el mismo resultado tambien con brecha negativa.
+ */
+
+long brecha_cambiaria(long r1, long r2, long r3, long r4, long r5, long r6,
+                      long blue, long oficial) {
+    (void)r1; (void)r2; (void)r3; (void)r4; (void)r5; (void)r6;
+    return (blue - oficial) * 10000 / oficial;
+}
+
+long pesos_a_dolares(long r1, long r2, long r3, long r4, long r5, long r6,
+                     long pesos, long cotizacion) {
+    (void)r1; (void)r2; (void)r3; (void)r4; (void)r5; (void)r6;
+    return pesos * 100 / cotizacion;
+}
+```
+
+`main.c` no cambia entre iteraciones: se enlaza contra `conversiones_c.c` para la primera
+y contra `conversiones.s` para la segunda. El `Makefile` genera los dos binarios.
+
+Tener las dos versiones sirve además como verificación cruzada: si dan distinto, el bug
+está en el ensamblador. Comparadas sobre **2000 casos al azar, dan idéntico en todos**,
+incluidas las brechas negativas, porque la división entera de C trunca hacia cero igual
+que `idivq`.
+
+### 6.5 La capa de Python: `python/cliente.py`
+
+Baja las dos cotizaciones, convierte los precios a centavos con `round()`, llama al
+binario de C y muestra el resultado.
+
+Usa **solo la biblioteca estándar** (`urllib` en vez de `requests`): en Ubuntu,
+`pip install` falla con *externally-managed-environment*, y así no hay nada que instalar.
+
+```python
+#!/usr/bin/env python3
+"""cliente.py — capa superior del TP.
+
+Consulta la cotizacion del dolar blue y oficial en dolarapi.com, convierte los
+precios de venta a centavos y se los pasa al programa en C, que hace el calculo
+llamando a las rutinas en ensamblador. Despues muestra el resultado.
+
+Uso (desde la raiz del repositorio):
+    python3 python/cliente.py                 brecha entre blue y oficial
+    python3 python/cliente.py 10000           ademas, cuantos dolares son 10000 pesos
+    python3 python/cliente.py 10000 --sin-asm usa la version en C puro (Iteracion 1)
+    python3 python/cliente.py --solo-api      solo baja y muestra los datos, sin calcular
+
+Usa solo la biblioteca estandar: no hace falta instalar nada con pip.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+# La URL base se puede cambiar con una variable de entorno, por ejemplo para
+# probar contra un servidor local sin depender de internet.
+API = os.environ.get("DOLARAPI_URL", "https://dolarapi.com/v1/dolares")
+RAIZ = Path(__file__).resolve().parent.parent
+TIMEOUT = 10  # segundos
+
+
+def a_centavos(valor):
+    """Convierte un precio en pesos a centavos enteros.
+
+    round() y no int(): el punto flotante no representa exactamente la mayoria
+    de los decimales, e int() trunca. 1024.09 * 100 da 102408.99999999999.
+    """
+    return round(float(valor) * 100)
+
+
+def formatear(n):
+    """Formatea centavos o centesimas al estilo argentino: 154000 -> '1.540,00'."""
+    signo = "-" if n < 0 else ""
+    entero, decimales = divmod(abs(n), 100)
+    return f"{signo}{entero:,}".replace(",", ".") + f",{decimales:02d}"
+
+
+def formatear_fecha(iso):
+    """'2026-10-12T12:55:00.000Z' -> '12/10/2026 12:55 UTC'."""
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime("%d/%m/%Y %H:%M UTC")
+    except (ValueError, AttributeError):
+        return str(iso)
+
+
+def obtener(casa):
+    """Devuelve (precio de venta en centavos, fecha de actualizacion)."""
+    url = f"{API}/{casa}"
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as respuesta:
+            datos = json.load(respuesta)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Error: la API respondio {e.code} al pedir {url}")
+    except urllib.error.URLError as e:
+        sys.exit(f"Error: no se pudo conectar con {url} ({e.reason})")
+    except TimeoutError:
+        sys.exit(f"Error: la API no respondio en {TIMEOUT} segundos ({url})")
+    except json.JSONDecodeError:
+        sys.exit(f"Error: la respuesta de {url} no es JSON valido")
+
+    if "venta" not in datos:
+        sys.exit(f"Error: la respuesta de {url} no trae el campo 'venta'")
+    try:
+        centavos = a_centavos(datos["venta"])
+    except (TypeError, ValueError):
+        sys.exit(f"Error: el precio de venta de {url} no es un numero: {datos['venta']!r}")
+    if centavos <= 0:
+        sys.exit(f"Error: el precio de venta de {casa} es {datos['venta']}, no se puede calcular")
+
+    return centavos, datos.get("fechaActualizacion", "sin fecha")
+
+
+def calcular(binario, blue, oficial, pesos):
+    """Invoca la capa de C y devuelve sus resultados como diccionario."""
+    argumentos = [str(binario), str(blue), str(oficial)]
+    if pesos is not None:
+        argumentos.append(str(pesos))
+
+    resultado = subprocess.run(argumentos, capture_output=True, text=True)
+    if resultado.returncode != 0:
+        sys.exit(f"Error en la capa de C: {resultado.stderr.strip()}")
+
+    # La capa de C imprime lineas clave=valor.
+    return {clave: int(valor)
+            for clave, valor in (linea.split("=", 1) for linea in resultado.stdout.split())}
+
+
+def main():
+    argumentos = sys.argv[1:]
+    sin_asm = "--sin-asm" in argumentos
+    solo_api = "--solo-api" in argumentos
+    argumentos = [a for a in argumentos if a not in ("--sin-asm", "--solo-api")]
+
+    if solo_api:
+        # Prueba de la capa de Python sola: no hace falta tener nada compilado.
+        for casa in ("blue", "oficial"):
+            centavos, fecha = obtener(casa)
+            print(f"{casa:8} venta = {centavos} centavos  ({formatear_fecha(fecha)})")
+        return
+
+    pesos = None
+    if argumentos:
+        try:
+            pesos = a_centavos(argumentos[0].replace(",", "."))
+        except ValueError:
+            sys.exit(f"Error: '{argumentos[0]}' no es un monto valido")
+        if pesos <= 0:
+            sys.exit("Error: el monto tiene que ser mayor que cero")
+
+    binario = RAIZ / ("calculadora_c" if sin_asm else "calculadora")
+    if not binario.exists():
+        sys.exit(f"Error: no existe {binario.name}. Compila primero con 'make'.")
+
+    blue, fecha_blue = obtener("blue")
+    oficial, fecha_oficial = obtener("oficial")
+
+    resultado = calcular(binario, blue, oficial, pesos)
+
+    print(f"Dolar blue     venta $ {formatear(blue):>10}   (actualizado {formatear_fecha(fecha_blue)})")
+    print(f"Dolar oficial  venta $ {formatear(oficial):>10}   (actualizado {formatear_fecha(fecha_oficial)})")
+    print()
+    print(f"Brecha cambiaria: {formatear(resultado['brecha_centesimas'])} %")
+    if pesos is not None:
+        print(f"$ {formatear(pesos)} al dolar blue = USD {formatear(resultado['dolares_centavos'])}")
+    print()
+    capa = "C puro (Iteracion 1)" if sin_asm else "ensamblador (Iteracion 2)"
+    print(f"Calculo realizado en: {capa}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Formas de usarlo, siempre desde la raíz del repositorio:
+
+```bash
+python3 python/cliente.py --solo-api        # paso 2: solo la API, sin nada compilado
+python3 python/cliente.py                   # brecha entre blue y oficial
+python3 python/cliente.py 10000             # ademas, cuantos dolares son $10.000
+python3 python/cliente.py 10000 --sin-asm   # lo mismo con la Iteracion 1 (C puro)
+```
+
+Salida esperada con los datos del 12/10/2026:
+
+```
+Dolar blue     venta $   1.540,00   (actualizado 12/10/2026 12:55 UTC)
+Dolar oficial  venta $   1.535,00   (actualizado 09/10/2026 18:55 UTC)
+
+Brecha cambiaria: 0,32 %
+$ 10.000,00 al dolar blue = USD 6,49
+
+Calculo realizado en: ensamblador (Iteracion 2)
+```
+
+Los errores salen como un mensaje claro, sin volcado de Python. Probados: API caída, API
+que responde 500, respuesta que no es JSON, falta el campo `venta`, precio en cero, monto
+inválido, y binario sin compilar.
+
+> **Sobre la prueba.** Desde el entorno donde se armó esta guía no se puede llegar a
+> dolarapi.com, así que el cliente se probó contra un servidor local que devuelve
+> **exactamente** el JSON obtenido con `curl` en el Paso 0. La URL base se puede cambiar
+> con la variable de entorno `DOLARAPI_URL` justamente para eso. Hay que correrlo una vez
+> contra la API real para confirmar.
+
+### 6.6 El `Makefile`
+
+Para no tipear los `as` y `gcc` a mano cada vez:
+
+```make
+# Makefile — compila las dos iteraciones del TP.
+#
+#   make          compila las dos versiones
+#   make iter1    calculadora_c : C puro, sin ensamblador (Iteracion 1)
+#   make iter2    calculadora   : C + ensamblador         (Iteracion 2)
+#   make prueba   compila y corre asm/prueba.c contra el ensamblador
+#   make clean    borra todo lo compilado
+#
+# OJO: las lineas de las recetas (las que tienen comandos) tienen que empezar
+# con un TAB, no con espacios. Si make dice "missing separator", es eso.
+
+CC      = gcc
+AS      = as
+CFLAGS  = -g3 -O0 -Wall -Wextra
+ASFLAGS = --64 -g
+
+.PHONY: all iter1 iter2 prueba clean
+
+all: iter1 iter2
+
+iter1: calculadora_c
+iter2: calculadora
+
+calculadora: c/main.o asm/conversiones.o
+	$(CC) -o $@ $^
+
+calculadora_c: c/main.o c/conversiones_c.o
+	$(CC) -o $@ $^
+
+asm/prueba: asm/prueba.o asm/conversiones.o
+	$(CC) -o $@ $^
+
+prueba: asm/prueba
+	./asm/prueba
+
+c/%.o: c/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+asm/%.o: asm/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+asm/%.o: asm/%.s
+	$(AS) $(ASFLAGS) -o $@ $<
+
+clean:
+	rm -f c/*.o asm/*.o calculadora calculadora_c asm/prueba
+```
+
+> Las líneas con comandos **tienen que empezar con un TAB**, no con espacios. Si al pegar
+> el editor convierte los TAB en espacios, `make` falla con `missing separator`. En VS
+> Code se ve abajo a la derecha: tiene que decir "Tab Size", no "Spaces".
+
+### 6.7 Cómo correr todo
+
+Desde la raíz del repositorio:
+
+```bash
+make                                   # compila las dos iteraciones
+make prueba                            # corre asm/prueba.c
+python3 python/cliente.py 10000        # el TP completo
+```
+
+Los binarios `calculadora`, `calculadora_c` y `asm/prueba`, y los `.o`, **no se suben**:
+son resultado de compilar y cada uno los genera en su máquina. Ya están en `.gitignore`.
+
+### 6.8 Paso a paso, commit por commit
 
 La consigna pide un commit por funcionalidad implementada **y validada**. Este desglose
 cumple eso y además permite repartir el trabajo entre los tres.
@@ -787,12 +1223,12 @@ cumple eso y además permite repartir el trabajo entre los tres.
 |---|---|---|
 | 0 | `curl` a los dos endpoints, mirar el JSON crudo | ✅ Hecho: los campos son `venta` y `fechaActualizacion` |
 | 1 | Escribir la decisión de punto fijo | ✅ Hecho: centavos (×100), precio de venta, `round()` al convertir |
-| 2 | `cliente.py`: baja, parsea e imprime los enteros escalados | Python solo, sin C todavía |
-| 3 | `conversiones.s` + `prueba.c` con valores fijos | La rutina da el número correcto, verificado a mano |
-| 4 | `main.c` real: recibe por `argv`, llama al ASM, imprime | La capa C anda sola desde la terminal |
-| 5 | Integración: Python invoca el binario y muestra el resultado | Las tres capas conectadas |
+| 2 | `python/cliente.py` (sección 6.5), probado con `--solo-api` | Python solo, sin nada compilado |
+| 3 | `asm/conversiones.s` + `asm/prueba.c` (sección 6.3) | `./prueba` da 0,32 % y USD 6,49 |
+| 4 | `c/main.c` + `c/conversiones_c.c` + `Makefile` (6.4 y 6.6) | `make` compila las dos iteraciones sin warnings |
+| 5 | Integración: `python3 python/cliente.py 10000` | Las tres capas conectadas, contra la API real |
 | 6 | Sesión de GDB: el stack antes, durante y después | **El requisito que más pesa** |
-| 7 | Manejo de errores: API caída, campo faltante, división por cero | No se rompe |
+| 7 | Probar los casos de error de 6.4 y 6.5 | Cada error da un mensaje claro y no se rompe nada |
 | 8 | README con compilación, uso y evidencia | Listo para entregar |
 
 Dos cosas sobre el orden, que no son caprichosas:
@@ -809,9 +1245,9 @@ Dos cosas sobre el orden, que no son caprichosas:
 `idivq` **aborta el programa** si el divisor es cero — no devuelve un error, lo mata con
 una excepción de hardware. Si la API devolviera el oficial en `0`, o si el parseo fallara
 y mandara un `0`, el binario se cae. La validación va en C antes de llamar a la rutina, y
-es parte del paso 7.
+está resuelto en `main.c` (sección 6.4); el paso 7 es comprobarlo.
 
-### 6.5 Estructura de archivos
+### 6.9 Estructura de archivos
 
 ```
 practico2/
@@ -821,25 +1257,31 @@ practico2/
 ├── PROCEDIMIENTO.md       el registro de lo hecho, con capturas
 ├── Makefile               para no tipear los as/gcc a mano
 ├── asm/
-│   └── conversiones.s     las rutinas de cálculo
+│   ├── conversiones.s     las rutinas de cálculo (Iteración 2)
+│   └── prueba.c           prueba de las rutinas con valores fijos
 ├── c/
-│   └── main.c             capa intermedia
+│   ├── main.c             capa intermedia
+│   └── conversiones_c.c   las mismas rutinas en C puro (Iteración 1)
 ├── python/
 │   └── cliente.py         capa superior
 └── capturas/              las capturas de las sesiones de GDB
 ```
+
+`make` genera además `calculadora`, `calculadora_c` y `asm/prueba`, que no se suben.
 
 ---
 
 ## Parte 7 — Por dónde seguir
 
 Las Partes 1 a 5 están terminadas y documentadas en `PROCEDIMIENTO.md`. Lo que queda es
-el TP propiamente dicho, siguiendo la tabla de 6.4:
+el TP propiamente dicho, siguiendo la tabla de 6.8. Todo el código está en las
+secciones 6.3 a 6.6, probado; cada paso consiste en crear los archivos, compilar,
+verificar que la salida coincida con la de la guía, y commitear.
 
 1. ~~Paso 0: verificar los campos de la API~~ y ~~Paso 1: decidir el punto fijo~~ — hechos
    (ver 6.2).
-2. Pasos 2 y 3 en paralelo, que no dependen uno del otro: uno arma `cliente.py`, otro
-   compila y prueba `conversiones.s` con `prueba.c`.
+2. Pasos 2 y 3 en paralelo, que no dependen uno del otro: uno arma `python/cliente.py` y
+   lo prueba con `--solo-api`; otro arma `asm/conversiones.s` y `asm/prueba.c`.
 3. Paso 4 cuando el 3 esté validado.
 4. Integración, GDB y errores, en ese orden.
 
