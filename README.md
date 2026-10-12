@@ -72,10 +72,38 @@ lleva el prefijo de su parte (`P2-04-direccion-de-retorno.jpg`, `P4-05-frame-sum
 | Parte 3 | C llamando a ensamblador con argumentos por registros (System V AMD64 ABI) | 5 | terminada |
 | Parte 4 | Paso de argumentos por la pila cuando se superan los seis registros, emulación de cdecl con `__asm__` y experimento de clobbers | 13 | terminada |
 | Parte 5 | Detalles de la ABI: alineación a 16 bytes, registros callee-saved y red zone | 7 | terminada |
-| Iteración 1 | Calculadora de brecha cambiaria en Python + C, sin ensamblador | — | pendiente |
-| Iteración 2 | Rutinas en ensamblador con pasaje por stack y depuración con GDB | — | pendiente |
+| Parte 6 | El TP: calculadora de brecha cambiaria. Iteración 1 (Python + C) e Iteración 2 (con ensamblador, pasaje por stack y depuración con GDB) | 8 | terminada |
 
 Todas las sesiones de depuración se hicieron con **gdb-dashboard**, como pide la cátedra.
+
+## Cómo compilar y usar
+
+Requiere Linux x86-64 con `gcc`, `as`, `make` y Python 3. No hace falta instalar ningún paquete de Python.
+
+```bash
+make                                       # compila las dos iteraciones
+python3 python/cliente.py                  # brecha entre el dólar blue y el oficial
+python3 python/cliente.py 10000            # además, cuántos dólares son $10.000
+python3 python/cliente.py 10000 --sin-asm  # lo mismo con la Iteración 1 (C puro)
+```
+
+```
+Dolar blue     venta $   1.540,00   (actualizado 12/10/2026 17:56 UTC)
+Dolar oficial  venta $   1.535,00   (actualizado 09/10/2026 18:55 UTC)
+
+Brecha cambiaria: 0,32 %
+$ 10.000,00 al dolar blue = USD 6,49
+
+Calculo realizado en: ensamblador (Iteracion 2)
+```
+
+| Archivo | Capa |
+|---|---|
+| `python/cliente.py` | Superior: consulta dolarapi.com y muestra el resultado |
+| `c/main.c` | Intermedia: valida la entrada y llama a las rutinas |
+| `asm/conversiones.s` | Inferior: el cálculo, con los parámetros por la pila (Iteración 2) |
+| `c/conversiones_c.c` | El mismo cálculo en C puro (Iteración 1) |
+| `asm/prueba.c` | Prueba de las rutinas con valores fijos (`make prueba`) |
 
 ## Conclusiones
 

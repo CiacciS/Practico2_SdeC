@@ -917,6 +917,210 @@ La función guarda sus datos en memoria que formalmente no reservó, y es correc
 
 ---
 
+# Parte 6: el trabajo práctico — calculadora de brecha cambiaria
+
+Con lo aprendido en las Partes 1 a 5 armamos la aplicación de tres capas que pide la consigna. Elegimos [dolarapi.com](https://dolarapi.com) como API y la **brecha cambiaria** entre el dólar blue y el oficial como cálculo. Los motivos de la elección, la aritmética de punto fijo y el código completo están en `GUIA.md`, Parte 6.
+
+```
+dolarapi.com ──JSON──► python/cliente.py ──centavos──► ./calculadora
+                                ▲                    c/main.c  ──pila──►  asm/conversiones.s
+                                └──── brecha_centesimas=32 ─────┘
+```
+
+| Capa | Archivo | Qué hace |
+|---|---|---|
+| Superior | `python/cliente.py` | Consulta las dos cotizaciones, convierte el precio de venta a centavos con `round()` y llama al binario de C |
+| Intermedia | `c/main.c` | Valida los argumentos y llama a la rutina con ocho parámetros, para que el 7° y el 8° viajen por la pila |
+| Inferior | `asm/conversiones.s` | `brecha_cambiaria`: `(blue − oficial) × 10000 / oficial`, leyendo los operandos de `16(%rbp)` y `24(%rbp)` |
+
+## 6.1 Respuesta de la API
+
+```bash
+curl https://dolarapi.com/v1/dolares/blue
+curl https://dolarapi.com/v1/dolares/oficial
+```
+
+Los campos que usamos son `venta` y `fechaActualizacion`. El 12/10/2026 el blue estaba a **1540** y el oficial a **1535**. El oficial era del 09/10 porque el 12 de octubre es feriado y no se actualiza.
+
+## 6.2 La rutina en ensamblador, probada sola
+
+Antes de conectar nada, probamos `asm/conversiones.s` con un `main` mínimo (`asm/prueba.c`) que le pasa valores fijos:
+
+```bash
+cd asm
+as --64 -g -o conversiones.o conversiones.s
+gcc -g3 -O0 -c prueba.c -o prueba.o
+gcc -o prueba prueba.o conversiones.o
+./prueba
+```
+
+```
+brecha: 32 centesimas = 0.32 %
+10000 pesos al blue: 649 centavos = USD 6.49
+```
+
+Verificado a mano: (1540 − 1535) / 1535 × 100 = 0,3257 → **0,32 %**, y 10000 / 1540 = 6,4935 → **6,49**. La rutina trunca porque `idivq` descarta el resto.
+
+## 6.3 Compilación de las dos iteraciones
+
+La consigna pide dos iteraciones: primero sin ensamblador y después con ensamblador. `c/conversiones_c.c` implementa las mismas dos rutinas en C puro, con la misma firma, así `main.c` no cambia: el `Makefile` lo enlaza contra uno u otro archivo.
+
+```bash
+make
+```
+
+```
+gcc -g3 -O0 -Wall -Wextra -c -o c/conversiones_c.o c/conversiones_c.c
+gcc -o calculadora_c c/main.o c/conversiones_c.o
+gcc -o calculadora c/main.o asm/conversiones.o
+```
+
+Genera `calculadora_c` (Iteración 1) y `calculadora` (Iteración 2), sin advertencias con `-Wall -Wextra`.
+
+<!-- captura P6-01 -->
+
+## 6.4 Validaciones de la capa de C
+
+`idivq` con divisor cero **no devuelve un error: mata el proceso** con una excepción del procesador. Por eso `main.c` rechaza la entrada inválida antes de llamar a la rutina:
+
+```bash
+./calculadora 154000 0
+./calculadora abc 153500
+./calculadora 154000x 153500
+./calculadora
+```
+
+```
+oficial fuera de rango: '0' (entre 1 y 100000000000000 centavos)
+blue no es un numero entero: 'abc'
+blue no es un numero entero: '154000x'
+uso: ./calculadora <blue_centavos> <oficial_centavos> [pesos_centavos]
+```
+
+Ningún caso llega al ensamblador ni produce `Floating point exception`.
+
+<!-- captura P6-02 -->
+
+## 6.5 Las tres capas funcionando, contra la API real
+
+```bash
+python3 python/cliente.py 10000
+python3 python/cliente.py 10000 --sin-asm
+```
+
+```
+Dolar blue     venta $   1.540,00   (actualizado 12/10/2026 17:56 UTC)
+Dolar oficial  venta $   1.535,00   (actualizado 09/10/2026 18:55 UTC)
+
+Brecha cambiaria: 0,32 %
+$ 10.000,00 al dolar blue = USD 6,49
+
+Calculo realizado en: ensamblador (Iteracion 2)
+```
+
+Las dos iteraciones dan **el mismo resultado**: la división entera de C trunca hacia cero igual que `idivq`.
+
+<!-- captura P6-03 -->
+
+## 6.6 El stack antes, durante y después de la rutina (GDB)
+
+Es la evidencia que pide la consigna. Depuramos el binario real con los valores del día:
+
+```bash
+gdb --args ./calculadora 154000 153500 1000000
+```
+
+```
+dashboard memory watch $rsp 48
+break main.c:55
+break brecha_cambiaria
+run
+```
+
+La línea 55 de `main.c` es la llamada a `brecha_cambiaria`.
+
+### Antes: el llamador prepara la llamada
+
+```
+x/12i $pc
+info registers rsp rbp
+```
+
+![Antes de la llamada](capturas/P6-04-gdb-antes-llamada.png)
+
+El compilador carga blue y oficial y los **empuja a la pila** con dos `push`; los seis primeros argumentos van en cero por registros (`%r9d`, `%r8d`, `%ecx`, `%edx`, `%esi`, `%edi`). Después del `call` viene `add $0x10,%rsp`: **la pila la limpia el llamador**. El punto de partida es `%rsp` = `…ddb0` y `%rbp` = `…ddf0`.
+
+Avanzamos con `stepi` hasta pasar los dos `push`:
+
+```
+x/2gx $rsp
+```
+
+![Argumentos en la pila](capturas/P6-05-gdb-argumentos-en-pila.png)
+
+En la cima están `0x25990` = **154000** (blue) y `0x2579c` = **153500** (oficial). `%rsp` bajó 16 bytes, a `…dda0`. El blue queda en la dirección más baja porque se empujó último: los argumentos se apilan de derecha a izquierda.
+
+### Durante: la rutina lee sus argumentos de la pila
+
+```
+continue
+stepi
+stepi
+x/4gx $rbp
+```
+
+![Marco completo](capturas/P6-06-gdb-marco-completo.png)
+
+Después del prólogo, el marco de `brecha_cambiaria` queda exactamente como lo documenta el comentario de `conversiones.s`:
+
+| Dirección | Valor | Qué es | Quién lo puso |
+|---|---|---|---|
+| `0(%rbp)` = `…dd90` | `0x7fffffffddf0` | `%rbp` de `main` | `pushq %rbp` del prólogo |
+| `8(%rbp)` = `…dd98` | `0x5555555553ad` | dirección de retorno, `main+295` | `call` |
+| `16(%rbp)` = `…dda0` | `0x25990` | **blue, 7° argumento** | `push %rax` de `main` |
+| `24(%rbp)` = `…dda8` | `0x2579c` | **oficial, 8° argumento** | `push %rdx` de `main` |
+
+La dirección de retorno `0x5555555553ad` es la del `add $0x10,%rsp` de la primera captura. **Esta es la prueba de que los parámetros llegan a la rutina por el stack y no por registros.**
+
+```
+advance 28
+info registers rax rdx
+```
+
+![Resultado](capturas/P6-07-gdb-resultado.png)
+
+`advance 28` corre hasta la línea 28 de `conversiones.s`, el `popq %rbp`. `%rax` = `0x20` = **32** centésimas = 0,32 %. `%rdx` = `0x157c0` = **88000** es el resto que deja `idivq` y que se descarta: 5.000.000 = 32 × 153.500 + 88.000.
+
+### Después: la pila vuelve a su estado original
+
+Ejecutamos el `popq %rbp`, el `ret` y el `add $0x10,%rsp`:
+
+```
+stepi
+stepi
+stepi
+info registers rsp rbp rax
+```
+
+![Después de la llamada](capturas/P6-08-gdb-despues.png)
+
+`%rsp` = `…ddb0` y `%rbp` = `…ddf0`, **exactamente los valores del principio**, y el resultado sigue en `%rax`. El recorrido completo de `%rsp`:
+
+```
+antes    2 push    call    prólogo   epílogo    ret     add $0x10
+ ddb0  →  dda0  →  dd98  →  dd90  →   dd98  →   dda0  →   ddb0
+         −16       −8       −8        +8        +8        +16
+```
+
+## Respuestas de la Parte 6
+
+- **¿Los parámetros viajan por el stack?** Sí. Declarando la rutina con ocho parámetros, el compilador está obligado por la ABI a empujar el 7° y el 8° a la pila, y la rutina los lee en `16(%rbp)` y `24(%rbp)`.
+- **¿Y el resultado?** Vuelve en `%rax`, como manda la convención. `main` lo guarda en la variable `brecha` y lo imprime.
+- **¿Quién limpia la pila?** El llamador, con `add $0x10,%rsp` apenas vuelve del `call`.
+- **¿Por qué centavos y no punto flotante?** Para no usar los registros `%xmm` y porque el punto flotante no representa exactamente la mayoría de los decimales: `1024.09 × 100` da `102408.99999999999`. Por eso Python convierte con `round()` y no con `int()`.
+
+---
+
 # Conclusiones
 
 1. **El pasaje de argumentos responde a un contrato estricto.** Los primeros seis argumentos enteros viajan en `%rdi`, `%rsi`, `%rdx`, `%rcx`, `%r8` y `%r9`, y el valor de retorno vuelve siempre en `%rax`. Lo verificamos en ensamblador escrito a mano (Parte 2) y en código generado por el compilador (Parte 3).
@@ -927,11 +1131,14 @@ La función guarda sus datos en memoria que formalmente no reservó, y es correc
 6. **Emular cdecl con `__asm__` produce el mismo marco**, pero es frágil: si no se declaran los registros que el `call` puede pisar, con `-O2` el programa imprime valores incorrectos.
 7. **La ABI tiene reglas que no se ven hasta que se rompen.** Una pila desalineada hace caer a `printf`. Un registro callee-saved no restaurado corrompe variables del llamador. Y la red zone explica por qué una función hoja puede usar memoria debajo de `%rsp`.
 8. **Para el trabajo práctico conviene la variante A**: pasar los parámetros por la pila declarando más de seis argumentos. Cumple el requisito de usar el stack, respeta la ABI al pie de la letra y deja al compilador a cargo de la alineación, la limpieza y los registros.
+9. **La variante A funcionó en el TP.** `brecha_cambiaria` recibe blue y oficial por la pila, en `16(%rbp)` y `24(%rbp)`, y devuelve el resultado en `%rax`. GDB muestra el marco completo y la pila vuelve exactamente a su estado inicial después de la llamada (Parte 6).
+10. **La validación tiene que estar antes del ensamblador.** `idivq` con divisor cero no devuelve un error, termina el proceso. La capa de C es la que filtra la entrada inválida.
+11. **Trabajar en centavos no es un rodeo.** El punto flotante falla incluso al convertir pesos a centavos (`1024.09 × 100 = 102408.99999999999`); la aritmética entera da resultados exactos y reproducibles, y es la que se puede hacer en ensamblador sin SSE.
 
 ---
 
 ## Nota sobre las direcciones de memoria
 
-Las direcciones del **stack** (`0x7fffffff…`) dependen de las variables de entorno y de la ruta del binario, así que **cambian entre máquinas y entre corridas**. No es un error. Por ejemplo, `%rsp` arranca en `…dd60` en la Parte 2 y en `…dcb0` en las Partes 3 y 4.
+Las direcciones del **stack** (`0x7fffffff…`) dependen de las variables de entorno y de la ruta del binario, así que **cambian entre máquinas y entre corridas**. No es un error. Por ejemplo, `%rsp` arranca en `…dd60` en la Parte 2 en `…dcb0` en las Partes 3 y 4, y en `…ddb0` en la Parte 6.
 
-Lo que se mantiene constante son los **valores** (`0xa`, `0x14`, `0x19`, `0x1e`, `0x23`), las direcciones de **código** (fijas gracias a `-no-pie`) y las **diferencias** entre direcciones, que son las que sostienen todo el análisis.
+Lo que se mantiene constante son los **valores** (`0xa`, `0x14`, `0x19`, `0x1e`, `0x23`, `0x25990`, `0x2579c`, `0x20`), las direcciones de **código** (fijas gracias a `-no-pie`) y las **diferencias** entre direcciones, que son las que sostienen todo el análisis.
