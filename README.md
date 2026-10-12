@@ -105,17 +105,3 @@ Calculo realizado en: ensamblador (Iteracion 2)
 | `c/conversiones_c.c` | El mismo cálculo en C puro (Iteración 1) |
 | `asm/prueba.c` | Prueba de las rutinas con valores fijos (`make prueba`) |
 
-## Conclusiones
-
-
-Del estudio previo de los stack frames (Partes 1 a 5) quedaron establecidas las bases que
-el TP necesita:
-
-- Los primeros seis argumentos enteros viajan por registros y el resultado vuelve en `%rax`.
-- Cuando hay más argumentos, el compilador empuja los excedentes a la pila de derecha a
-  izquierda, y la función los lee en `16(%rbp)`, `24(%rbp)`, etc. La pila la limpia el llamador.
-- Declarar la función en C con más de seis parámetros es la forma más segura de pasar
-  argumentos por el stack: respeta la ABI y deja al compilador a cargo de la alineación,
-  la limpieza y los registros preservados.
-- Las reglas de la ABI que no se ven (alineación, callee-saved) rompen el programa cuando
-  no se respetan, así que las rutinas en ensamblador del TP tienen que cumplirlas.
