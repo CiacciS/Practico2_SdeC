@@ -61,13 +61,33 @@ practico-2/
 | [`PROCEDIMIENTO.md`](PROCEDIMIENTO.md) | El registro del trabajo realizado, parte por parte, con las capturas que verifican cada resultado |
 
 El procedimiento se lleva en **un solo documento**, al que se le van agregando las partes
-a medida que avanzamos.
+a medida que avanzamos. Las partes siguen la numeración de `GUIA.md`, y cada captura
+lleva el prefijo de su parte (`P2-04-direccion-de-retorno.jpg`, `P4-05-frame-suma-por-pila.jpg`, etc.).
 
-| Parte | Tema | Estado |
-|---|---|---|
-| Parte 1 | Anatomía del stack frame: prólogo, epílogo, dirección de retorno y paso de argumentos por registros | terminada |
-| Parte 2 | Paso de argumentos por la pila cuando se superan los seis registros de la ABI | pendiente |
+| Parte | Tema | Capturas | Estado |
+|---|---|---|---|
+| Parte 1 | Preparación del entorno: herramientas y gdb-dashboard | 1 | terminada |
+| Parte 2 | Una función en ensamblador puro: prólogo, epílogo, variables locales y dirección de retorno | 10 | terminada |
+| Parte 3 | C llamando a ensamblador con argumentos por registros (System V AMD64 ABI) | 5 | terminada |
+| Parte 4 | Paso de argumentos por la pila cuando se superan los seis registros, emulación de cdecl con `__asm__` y experimento de clobbers | 13 | terminada |
+| Parte 5 | Detalles de la ABI: alineación a 16 bytes, registros callee-saved y red zone | 7 | terminada |
+| Iteración 1 | Calculadora GINI en Python + C, sin ensamblador | — | pendiente |
+| Iteración 2 | Rutinas en ensamblador con pasaje por stack y depuración con GDB | — | pendiente |
+
+Todas las sesiones de depuración se hicieron con **gdb-dashboard**, como pide la cátedra.
 
 ## Conclusiones
 
-*A completar una vez finalizadas todas las partes.*
+*Las conclusiones del trabajo práctico se completan al finalizar las dos iteraciones.*
+
+Del estudio previo de los stack frames (Partes 1 a 5) quedaron establecidas las bases que
+el TP necesita:
+
+- Los primeros seis argumentos enteros viajan por registros y el resultado vuelve en `%rax`.
+- Cuando hay más argumentos, el compilador empuja los excedentes a la pila de derecha a
+  izquierda, y la función los lee en `16(%rbp)`, `24(%rbp)`, etc. La pila la limpia el llamador.
+- Declarar la función en C con más de seis parámetros es la forma más segura de pasar
+  argumentos por el stack: respeta la ABI y deja al compilador a cargo de la alineación,
+  la limpieza y los registros preservados.
+- Las reglas de la ABI que no se ven (alineación, callee-saved) rompen el programa cuando
+  no se respetan, así que las rutinas en ensamblador del TP tienen que cumplirlas.
