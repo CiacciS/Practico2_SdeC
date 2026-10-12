@@ -1,6 +1,6 @@
 # Trabajo Práctico N°2
 
-## Calculadora de índices GINI
+## Calculadora de brecha cambiaria
 
 **Convenciones de llamada entre lenguajes de alto y bajo nivel en x86-64**
 
@@ -22,14 +22,15 @@ Cátedra de Sistemas de Computación
 
 ## De qué se trata
 
-El trabajo consiste en construir una aplicación de **tres capas** que obtenga y procese
-el índice de Gini publicado por el Banco Mundial:
+El trabajo consiste en construir una aplicación de **tres capas** que obtenga la
+cotización del dólar blue y del oficial desde [dolarapi.com](https://dolarapi.com) y
+calcule la brecha cambiaria entre ambos:
 
 | Capa | Lenguaje | Responsabilidad |
 |---|---|---|
-| Superior | Python | Consultar la API REST del Banco Mundial y recuperar los datos |
-| Intermedia | C | Recibir esos datos e invocar las rutinas de bajo nivel |
-| Inferior | Ensamblador x86-64 | Convertir los valores de punto flotante a enteros y devolver el índice sumando uno |
+| Superior | Python | Consultar la API REST de dolarapi.com y convertir los precios a centavos |
+| Intermedia | C | Recibir esos datos, validarlos e invocar las rutinas de bajo nivel |
+| Inferior | Ensamblador x86-64 | Calcular la brecha cambiaria y la conversión de pesos a dólares con aritmética entera |
 
 La condición central del práctico es que el pasaje de parámetros y la devolución de
 resultados entre la capa de C y la de ensamblador se realice **a través del stack**, es
@@ -71,7 +72,7 @@ lleva el prefijo de su parte (`P2-04-direccion-de-retorno.jpg`, `P4-05-frame-sum
 | Parte 3 | C llamando a ensamblador con argumentos por registros (System V AMD64 ABI) | 5 | terminada |
 | Parte 4 | Paso de argumentos por la pila cuando se superan los seis registros, emulación de cdecl con `__asm__` y experimento de clobbers | 13 | terminada |
 | Parte 5 | Detalles de la ABI: alineación a 16 bytes, registros callee-saved y red zone | 7 | terminada |
-| Iteración 1 | Calculadora GINI en Python + C, sin ensamblador | — | pendiente |
+| Iteración 1 | Calculadora de brecha cambiaria en Python + C, sin ensamblador | — | pendiente |
 | Iteración 2 | Rutinas en ensamblador con pasaje por stack y depuración con GDB | — | pendiente |
 
 Todas las sesiones de depuración se hicieron con **gdb-dashboard**, como pide la cátedra.
