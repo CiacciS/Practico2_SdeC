@@ -999,6 +999,9 @@ from pathlib import Path
 API = os.environ.get("DOLARAPI_URL", "https://dolarapi.com/v1/dolares")
 RAIZ = Path(__file__).resolve().parent.parent
 TIMEOUT = 10  # segundos
+# Algunas APIs rechazan con 403 el identificador por defecto de urllib
+# ("Python-urllib/3.x") porque lo toman como un bot.
+CABECERAS = {"User-Agent": "practico2-sistemas-de-computacion/1.0"}
 
 
 def a_centavos(valor):
@@ -1029,7 +1032,8 @@ def obtener(casa):
     """Devuelve (precio de venta en centavos, fecha de actualizacion)."""
     url = f"{API}/{casa}"
     try:
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as respuesta:
+        pedido = urllib.request.Request(url, headers=CABECERAS)
+        with urllib.request.urlopen(pedido, timeout=TIMEOUT) as respuesta:
             datos = json.load(respuesta)
     except urllib.error.HTTPError as e:
         sys.exit(f"Error: la API respondio {e.code} al pedir {url}")
