@@ -107,7 +107,6 @@ Calculo realizado en: ensamblador (Iteracion 2)
 
 ## Conclusiones
 
-*Las conclusiones del trabajo práctico se completan al finalizar las dos iteraciones.*
 
 Del estudio previo de los stack frames (Partes 1 a 5) quedaron establecidas las bases que
 el TP necesita:
