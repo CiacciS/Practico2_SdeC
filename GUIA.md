@@ -577,11 +577,45 @@ GET https://dolarapi.com/v1/dolares/blue
 GET https://dolarapi.com/v1/dolares/oficial
 ```
 
-> **Verificar antes de escribir una línea de código.** Los nombres exactos de los campos
-> de la respuesta (`compra`, `venta`, `casa`, `fechaActualizacion`) hay que confirmarlos
-> con un `curl` contra la API real: no están verificados en esta guía. Es el Paso 0.
+Respuesta real de la API, obtenida con `curl` el 12/10/2026 (Paso 0):
+
+```json
+{
+  "moneda": "USD",
+  "casa": "blue",
+  "nombre": "Blue",
+  "compra": 1520,
+  "venta": 1540,
+  "fechaActualizacion": "2026-10-12T12:55:00.000Z"
+}
+```
+
+```json
+{
+  "moneda": "USD",
+  "casa": "oficial",
+  "nombre": "Oficial",
+  "compra": 1485,
+  "venta": 1535,
+  "fechaActualizacion": "2026-10-09T18:55:00.000Z"
+}
+```
+
+Los campos que usamos son **`venta`** y **`fechaActualizacion`**.
+
+Dos observaciones sobre estos datos:
+
+- **Los precios pueden venir enteros o con decimales.** Ese día llegaron como `1540`,
+  pero otros días llegan como `1535.57`. El parseo tiene que aceptar las dos formas.
+- **Las fechas de actualización pueden no coincidir.** El 12/10 es feriado y el oficial
+  no se actualiza, así que ese día el blue era del 12 y el oficial del 9. El programa
+  muestra las dos fechas junto al resultado, para que quede claro qué se está comparando.
 
 #### El cálculo
+
+Usamos el precio de **venta** de las dos cotizaciones: es lo que paga quien compra
+dólares y es la cifra que se publica habitualmente. Con el de compra la brecha da otro
+número, así que la elección queda fijada acá.
 
 La **brecha cambiaria** entre el dólar blue y el oficial:
 
@@ -598,21 +632,47 @@ dólares = pesos × 100 / cotización
 
 #### La aritmética de punto fijo
 
-La API devuelve `1500.5`. Hacer punto flotante en ensamblador obliga a meterse con SSE y
-los registros `%xmm`, que es otro tema entero. La solución es **trabajar en centavos**:
-Python multiplica por 100 y manda enteros, el ensamblador opera con enteros, y Python
-divide por 100 al mostrar.
+La API puede devolver `1535.57`. Hacer punto flotante en ensamblador obliga a meterse con
+SSE y los registros `%xmm`, que es otro tema entero. La solución es **trabajar en
+centavos**: Python multiplica por 100 y manda enteros, el ensamblador opera con enteros, y
+Python divide por 100 al mostrar.
 
-Un ejemplo completo, con los números reales que da la rutina:
+Con los valores reales de venta del 12/10/2026, pasados por la rutina:
 
 ```
-blue = 1500,00  →  150000 centavos
-oficial = 1000,00  →  100000 centavos
+blue    = 1540,00  →  154000 centavos
+oficial = 1535,00  →  153500 centavos
 
-ASM:  (150000 − 100000) × 10000 / 100000  =  5000
+ASM:  (154000 − 153500) × 10000 / 153500  =  32
 
-5000 centésimas de punto porcentual  →  Python muestra 50,00 %
+32 centésimas de punto porcentual  →  Python muestra 0,32 %
 ```
+
+El valor exacto es 0,3257 %; el ensamblador trunca a 0,32 % porque `idivq` descarta el
+resto.
+
+#### La conversión a centavos: `round()`, no `int()`
+
+Pasar el precio a centavos parece trivial y tiene una trampa:
+
+```python
+centavos = int(dato["venta"] * 100)            # MAL
+centavos = round(float(dato["venta"]) * 100)   # BIEN
+```
+
+El punto flotante no representa exactamente la mayoría de los decimales, y `int()`
+trunca hacia abajo:
+
+```
+1024.09 * 100  =  102408.99999999999   →   int() = 102408   (debería ser 102409)
+```
+
+Probando todos los precios posibles entre $1000,00 y $1999,99, **`int()` da un centavo de
+menos en 4588 de cada 100.000**. `round()` los corrige a todos. El `float()` previo es para
+aceptar tanto `1540` como `1535.57`, que son las dos formas en que llega el dato.
+
+Este error es, en sí mismo, la mejor justificación de la decisión de diseño: el punto
+flotante falla incluso en algo tan simple como pasar pesos a centavos.
 
 El factor es `10000` y no `100` porque se quieren dos decimales en el resultado: `100`
 para el porcentaje y `100` más para las centésimas.
@@ -725,8 +785,8 @@ cumple eso y además permite repartir el trabajo entre los tres.
 
 | # | Paso | Qué tiene que quedar validado |
 |---|---|---|
-| 0 | `curl` a los dos endpoints, mirar el JSON crudo | La API responde y sabemos los nombres exactos de los campos |
-| 1 | Escribir la decisión de punto fijo | Queda documentado el factor y qué se trunca |
+| 0 | `curl` a los dos endpoints, mirar el JSON crudo | ✅ Hecho: los campos son `venta` y `fechaActualizacion` |
+| 1 | Escribir la decisión de punto fijo | ✅ Hecho: centavos (×100), precio de venta, `round()` al convertir |
 | 2 | `cliente.py`: baja, parsea e imprime los enteros escalados | Python solo, sin C todavía |
 | 3 | `conversiones.s` + `prueba.c` con valores fijos | La rutina da el número correcto, verificado a mano |
 | 4 | `main.c` real: recibe por `argv`, llama al ASM, imprime | La capa C anda sola desde la terminal |
@@ -776,8 +836,8 @@ practico2/
 Las Partes 1 a 5 están terminadas y documentadas en `PROCEDIMIENTO.md`. Lo que queda es
 el TP propiamente dicho, siguiendo la tabla de 6.4:
 
-1. **Paso 0, antes que nada:** `curl` a los dos endpoints de dolarapi y anotar los nombres
-   exactos de los campos. Todo lo demás depende de eso.
+1. ~~Paso 0: verificar los campos de la API~~ y ~~Paso 1: decidir el punto fijo~~ — hechos
+   (ver 6.2).
 2. Pasos 2 y 3 en paralelo, que no dependen uno del otro: uno arma `cliente.py`, otro
    compila y prueba `conversiones.s` con `prueba.c`.
 3. Paso 4 cuando el 3 esté validado.
