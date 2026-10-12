@@ -1218,7 +1218,185 @@ python3 python/cliente.py 10000        # el TP completo
 Los binarios `calculadora`, `calculadora_c` y `asm/prueba`, y los `.o`, **no se suben**:
 son resultado de compilar y cada uno los genera en su máquina. Ya están en `.gitignore`.
 
-### 6.8 Paso a paso, commit por commit
+### 6.8 La sesión de GDB: el stack antes, durante y después
+
+Es el requisito que más pesa: la consigna pide **mostrar con GDB el estado del área de
+memoria que contiene el stack antes, durante y después de la función**. Se depura el TP
+real, `./calculadora`, con los valores del 12/10/2026.
+
+```bash
+make
+gdb --args ./calculadora 154000 153500 1000000
+```
+
+`--args` le dice a GDB que lo que sigue son los argumentos del programa.
+
+Dentro de GDB, **un comando por línea**:
+
+```
+dashboard memory watch $rsp 48
+break main.c:55
+break brecha_cambiaria
+run
+```
+
+La línea 55 de `main.c` es la llamada a `brecha_cambiaria`. El programa se detiene ahí,
+antes de preparar los argumentos.
+
+#### ANTES — el llamador prepara la llamada
+
+```
+x/12i $pc
+info registers rsp rbp
+```
+
+`x/12i $pc` muestra las doce instrucciones que siguen. Es la evidencia central de que los
+argumentos van por la pila:
+
+```
+mov    -0x28(%rbp),%rdx           <- carga oficial
+mov    -0x30(%rbp),%rax           <- carga blue
+push   %rdx                       <- 8vo argumento (oficial) a la pila
+push   %rax                       <- 7mo argumento (blue) a la pila
+mov    $0x0,%r9d                  <- argumentos 1 a 6 por registros, en cero
+mov    $0x0,%r8d
+mov    $0x0,%ecx
+mov    $0x0,%edx
+mov    $0x0,%esi
+mov    $0x0,%edi
+call   <brecha_cambiaria>
+add    $0x10,%rsp                 <- al volver, el llamador limpia los 16 bytes
+```
+
+📸 **Captura 1.** Anotar los valores de `%rsp` y `%rbp`: son la referencia del "antes".
+
+Ahora se ejecutan los dos `push`. Hacer `stepi` y mirar el panel **Assembly** hasta que la
+flecha quede sobre el primer `mov $0x0,%r9d` (son 4 `stepi`: los dos `mov` y los dos
+`push`; con otra versión de gcc puede variar). Entonces:
+
+```
+info registers rsp
+x/2gx $rsp
+```
+
+```
+0x...880:  0x0000000000025990  0x000000000002579c
+```
+
+`0x25990` es **154000** (blue) y `0x2579c` es **153500** (oficial): los dos argumentos ya
+están en la cima de la pila, y `%rsp` bajó **16 bytes**. El blue queda en la dirección más
+baja porque se empujó último.
+
+📸 **Captura 2.**
+
+#### DURANTE — la rutina lee sus argumentos de la pila
+
+```
+continue
+```
+
+El programa se detiene en la primera instrucción de `brecha_cambiaria`, antes del
+prólogo:
+
+```
+x/3gx $rsp
+```
+
+```
+0x...878:  0x00005555555553aa  0x0000000000025990
+0x...888:  0x000000000002579c
+```
+
+El `call` apiló la **dirección de retorno** (`main+295`, la instrucción `add $0x10,%rsp`
+que se vio en la Captura 1) encima de los argumentos. `%rsp` bajó otros 8 bytes.
+
+Se ejecuta el prólogo (`pushq %rbp` y `movq %rsp,%rbp`):
+
+```
+stepi
+stepi
+x/4gx $rbp
+```
+
+```
+0x...870:  0x00007fffffffc8d0  0x00005555555553aa     <- 0(%rbp)  y 8(%rbp)
+0x...880:  0x0000000000025990  0x000000000002579c     <- 16(%rbp) y 24(%rbp)
+```
+
+Este es **el marco completo**, exactamente como lo describe el comentario de
+`conversiones.s`:
+
+| Dirección | Contenido | Quién lo puso |
+|---|---|---|
+| `0(%rbp)` | `%rbp` de `main` | `pushq %rbp` del prólogo |
+| `8(%rbp)` | dirección de retorno, `main+295` | `call` |
+| `16(%rbp)` | `0x25990` = 154000, blue | `push %rax` de `main` |
+| `24(%rbp)` | `0x2579c` = 153500, oficial | `push %rdx` de `main` |
+
+📸 **Captura 3. Es la más importante del TP:** muestra que la rutina recibe sus
+parámetros por la pila y no por registros.
+
+Se deja correr la cuenta hasta el epílogo:
+
+```
+advance 28
+info registers rax rdx
+```
+
+`advance 28` avanza hasta la línea 28 de `conversiones.s`, el `popq %rbp`.
+
+```
+rax  0x20     32
+rdx  0x157c0  88000
+```
+
+`%rax` = **32** centésimas = 0,32 %. `%rdx` tiene el **resto** de la división, que `idivq`
+deja ahí y que se descarta: 5.000.000 = 32 × 153.500 + 88.000.
+
+📸 **Captura 4.**
+
+#### DESPUÉS — el stack vuelve a su estado original
+
+```
+stepi
+stepi
+x/i $pc
+info registers rsp
+```
+
+El `popq %rbp` y el `ret` ya se ejecutaron: estamos de vuelta en `main`, parados en el
+`add $0x10,%rsp`. `%rsp` todavía apunta a los dos argumentos: **la rutina no los limpia, lo
+hace el llamador**.
+
+```
+stepi
+info registers rsp rbp rax
+```
+
+Después del `add`, `%rsp` y `%rbp` tienen **exactamente los mismos valores que en la
+Captura 1**, y el resultado sigue en `%rax`.
+
+📸 **Captura 5.**
+
+El recorrido completo de `%rsp`:
+
+```
+antes    2 push    call    prólogo   epílogo    ret     add $0x10
+ c890  →  c880  →  c878  →  c870  →   c878  →   c880  →   c890
+         −16       −8       −8        +8        +8        +16
+```
+
+#### Qué tiene que coincidir en tu máquina
+
+Las direcciones del stack (`0x7fffffffc...`) y los desplazamientos como `main+295` pueden
+ser distintos según la máquina y la versión de gcc. Lo que **tiene** que coincidir:
+
+- los valores `0x25990`, `0x2579c`, `0x20` y `0x157c0`;
+- las **diferencias** de `%rsp` del cuadro anterior;
+- que en `8(%rbp)` esté la dirección de la instrucción `add $0x10,%rsp`;
+- que en la Captura 5, `%rsp` y `%rbp` sean iguales a los de la Captura 1.
+
+### 6.9 Paso a paso, commit por commit
 
 La consigna pide un commit por funcionalidad implementada **y validada**. Este desglose
 cumple eso y además permite repartir el trabajo entre los tres.
@@ -1231,7 +1409,7 @@ cumple eso y además permite repartir el trabajo entre los tres.
 | 3 | `asm/conversiones.s` + `asm/prueba.c` (sección 6.3) | `./prueba` da 0,32 % y USD 6,49 |
 | 4 | `c/main.c` + `c/conversiones_c.c` + `Makefile` (6.4 y 6.6) | `make` compila las dos iteraciones sin warnings |
 | 5 | Integración: `python3 python/cliente.py 10000` | Las tres capas conectadas, contra la API real |
-| 6 | Sesión de GDB: el stack antes, durante y después | **El requisito que más pesa** |
+| 6 | Sesión de GDB de la sección 6.8 | **El requisito que más pesa**: las 5 capturas |
 | 7 | Probar los casos de error de 6.4 y 6.5 | Cada error da un mensaje claro y no se rompe nada |
 | 8 | README con compilación, uso y evidencia | Listo para entregar |
 
@@ -1251,7 +1429,7 @@ una excepción de hardware. Si la API devolviera el oficial en `0`, o si el pars
 y mandara un `0`, el binario se cae. La validación va en C antes de llamar a la rutina, y
 está resuelto en `main.c` (sección 6.4); el paso 7 es comprobarlo.
 
-### 6.9 Estructura de archivos
+### 6.10 Estructura de archivos
 
 ```
 practico2/
@@ -1278,7 +1456,7 @@ practico2/
 ## Parte 7 — Por dónde seguir
 
 Las Partes 1 a 5 están terminadas y documentadas en `PROCEDIMIENTO.md`. Lo que queda es
-el TP propiamente dicho, siguiendo la tabla de 6.8. Todo el código está en las
+el TP propiamente dicho, siguiendo la tabla de 6.9. Todo el código está en las
 secciones 6.3 a 6.6, probado; cada paso consiste en crear los archivos, compilar,
 verificar que la salida coincida con la de la guía, y commitear.
 
